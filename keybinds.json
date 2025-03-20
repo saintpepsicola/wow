@@ -1,0 +1,22 @@
+{
+  "priest": {
+    "darksmite": "3"
+  },
+  "mage": {
+    "pyro": "3",
+    "fireblast": "2",
+    "flamestrike": "6",
+    "fireball": "7",
+    "scorch": "5",
+    "phoenix": "1",
+    "arcanebuff": "8"
+  },
+  "warlock": {
+    "phoenix": "1",
+    "agony": "1",
+    "sbolt": "7",
+    "rapture": "2",
+    "corruption": "3",
+    "unstable": "4"
+  }
+}
