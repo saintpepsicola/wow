@@ -14,9 +14,8 @@ from queue import Queue
 import concurrent.futures
 from tkmacosx import Button
 import keyboard
-import pynput
-from pynput.keyboard import Key, KeyCode
 import keyboard_utils
+import Quartz.CoreGraphics as CG
 
 # Global variables
 overlay_position = None
@@ -111,23 +110,31 @@ def setup_keybinds(class_name, spell_files):
 def process_screen(screen):
     best_match = (None, None, 0)
     try:
+        # Convert to grayscale only once
         screen_gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
-        for name, (template, key) in ability_templates.items():
-            if template is None:
+        
+        # Use a regular threshold for accurate matching
+        threshold = 0.75
+        
+        for name, (template_gray, key) in ability_templates.items():
+            if template_gray is None:
                 continue
             try:
-                template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+                # Use the pre-converted grayscale template
                 result = cv2.matchTemplate(screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, _ = cv2.minMaxLoc(result)
-                if max_val > 0.75 and max_val > best_match[2]:
+                
+                if max_val > threshold and max_val > best_match[2]:
                     best_match = (name, key, max_val)
-            except:
+            except Exception as e:
+                print(f"❌ Error matching template {name}: {str(e)}")
                 continue
-    except:
+    except Exception as e:
+        print(f"❌ Error in process_screen: {str(e)}")
         pass
     
     if best_match[0]:
-        print(f"🔍 Matched {best_match[0]}: Score = {best_match[2]:.3f}")
+        print(f"🔍 Matched {best_match[0]}: Score = {best_match[2]:.3f}, Key = {best_match[1]}")
         return best_match[0], best_match[1]
     return None, None
 
@@ -135,9 +142,9 @@ def screen_capture_thread(overlay_root):
     global running, is_paused
     sct = mss()
     last_capture_time = 0
-    min_capture_interval = 0.001  # 1000 FPS max
+    min_capture_interval = 0.1
     last_key_press = 0
-    min_key_interval = 0.05  # 50ms between same key presses
+    min_key_interval = 0.5
     last_key = None
     
     while running:
@@ -147,7 +154,7 @@ def screen_capture_thread(overlay_root):
                 continue
                 
             if is_paused:
-                time.sleep(0.001)
+                time.sleep(0.1)
                 continue
 
             x, y = overlay_root.winfo_x(), overlay_root.winfo_y()
@@ -161,10 +168,13 @@ def screen_capture_thread(overlay_root):
                     action_queue.put(("press", key))
                     last_key_press = current_time
                     last_key = key
+            else:
+                save_unrecognized_ability(screen)
             
             last_capture_time = current_time
             
         except Exception as e:
+            print(f"❌ Error in screen capture: {str(e)}")
             continue
 
 def press_keys(keys):
@@ -218,6 +228,75 @@ def create_overlay():
     canvas.pack(fill='none', expand=False)
     print("🎨 Canvas packed")
 
+    # Use macOS-native approach with Quartz for key detection
+    last_toggle_time = 0
+    
+    # Mapping of keycode to key names for macOS
+    KEYCODES = {
+        0: 'a', 1: 's', 2: 'd', 3: 'f', 4: 'h', 5: 'g', 6: 'z', 7: 'x', 8: 'c', 9: 'v', 
+        11: 'b', 12: 'q', 13: 'w', 14: 'e', 15: 'r', 16: 'y', 17: 't', 18: '1', 19: '2', 
+        20: '3', 21: '4', 22: '5', 23: '6', 24: '7', 25: '8', 26: '9', 27: '0', 
+        28: 'return', 29: 'esc', 31: 'tab', 32: 'space', 33: 'delete', 34: 'left', 
+        35: 'right', 36: 'down', 37: 'up'
+    }
+    
+    def key_event_callback(proxy, event_type, event, refcon):
+        """Callback for key events."""
+        nonlocal last_toggle_time
+        
+        # Get keycode and flags
+        keycode = CG.CGEventGetIntegerValueField(event, CG.kCGKeyboardEventKeycode)
+        flags = CG.CGEventGetFlags(event)
+        
+        # Debug key events
+        key_name = KEYCODES.get(keycode, f"unknown({keycode})")
+        cmd_pressed = (flags & 0x100) > 0
+        
+        if event_type == CG.kCGEventKeyDown:
+            # Only log the CMD+D key press when it's actually triggered
+            if cmd_pressed and keycode == 2:
+                current_time = time.time()
+                if current_time - last_toggle_time > 0.5:  # Debounce
+                    # Don't call toggle_pause directly - instead, schedule it on main thread
+                    overlay_root.after(0, toggle_pause)
+                    last_toggle_time = current_time
+                    print("✅ CMD+D hotkey detected!")
+        
+        # Keep propagating events
+        return event
+    
+    # Set up the event tap in a separate thread to not block the main UI
+    def start_quartz_listener():
+        # Create the event tap
+        event_tap = CG.CGEventTapCreate(
+            CG.kCGSessionEventTap,
+            CG.kCGHeadInsertEventTap,
+            0,  # Active, not passive
+            CG.kCGEventMaskForAllEvents,
+            key_event_callback,
+            None
+        )
+        
+        if not event_tap:
+            print("⚠️ Failed to create event tap")
+            return
+            
+        # Create a run loop source and add to current run loop
+        run_loop_source = CG.CFMachPortCreateRunLoopSource(None, event_tap, 0)
+        CG.CFRunLoopAddSource(CG.CFRunLoopGetCurrent(), run_loop_source, CG.kCFRunLoopDefaultMode)
+        
+        # Enable the event tap
+        CG.CGEventTapEnable(event_tap, True)
+        
+        # Start the run loop
+        CG.CFRunLoopRun()
+    
+    # Start the Quartz listener in a separate thread
+    quartz_thread = threading.Thread(target=start_quartz_listener)
+    quartz_thread.daemon = True
+    quartz_thread.start()
+    print("⌨️ Pause hotkey activated (press CMD+D)")
+
     button_root = tk.Tk()
     button_root.overrideredirect(True)
     button_root.attributes('-alpha', 0.95)
@@ -227,13 +306,18 @@ def create_overlay():
     def toggle_pause():
         global is_paused
         is_paused = not is_paused
+        # Schedule UI updates on main thread
+        button_root.after(0, lambda: update_toggle_button_state())
+        print(f"⏯️ Toggled: {'Paused' if is_paused else 'Running'}")
+    
+    def update_toggle_button_state():
+        # This function is called by the main thread via after()
         toggle_btn.configure(
             text="▶" if is_paused else "⏸",
             bg='#ff4d4d' if is_paused else '#4dff4d',
             activebackground='#cc0000' if is_paused else '#00cc00'
         )
-        print(f"⏯️ Toggled: {'Paused' if is_paused else 'Running'}")
-
+    
     toggle_btn = Button(
         button_root,
         text="⏸",
@@ -284,24 +368,24 @@ def create_overlay():
         overlay_root.after(100, update_border_color)
 
     def process_queues():
+        """Process the action queue to trigger key presses"""
         while not action_queue.empty():
             try:
                 action, value = action_queue.get_nowait()
+                
                 if action == "press" and not is_paused:
                     if value.isdigit():  # Only process number keys
-                        print(f"🎯 Attempting to press key '{value}'")
                         try:
                             # Use our custom keyboard module
-                            success = keyboard_utils.send_key_combo('', value)
-                            if not success:
-                                print(f"⚠️ Failed to press key '{value}'")
+                            keyboard_utils.send_key_combo('', value)
                         except Exception as e:
                             print(f"❌ Error pressing key '{value}': {str(e)}")
             except Exception as e:
                 print(f"❌ Error processing queue: {str(e)}")
                 continue
         
-        overlay_root.after(1, process_queues)
+        # Check again after a short delay
+        overlay_root.after(10, process_queues)
 
     capture_thread = threading.Thread(target=screen_capture_thread, args=(overlay_root,))
     capture_thread.daemon = True
@@ -353,6 +437,7 @@ def select_class():
         selected_class = class_name
         settings['save_unrecognized'] = save_unrecognized_var.get()
         save_settings()
+        print(f"⚙️ Save unrecognized abilities: {'Enabled' if settings['save_unrecognized'] else 'Disabled'}")
         root.destroy()
     
     for class_name in sorted(classes):
@@ -368,8 +453,9 @@ def select_class():
     save_unrecognized_var = tk.BooleanVar(value=settings.get('save_unrecognized', False))
     save_checkbox = tk.Checkbutton(
         settings_frame, 
-        text="Save unrecognized abilities (may impact performance)",
-        variable=save_unrecognized_var
+        text="Save unrecognized abilities to pending folder (for training)",
+        variable=save_unrecognized_var,
+        font=('Arial', 9, 'bold')
     )
     save_checkbox.pack(pady=5)
     
@@ -391,30 +477,38 @@ def load_ability_templates():
     
     setup_keybinds(selected_class, spell_files)
     
+    print(f"🔄 Pre-processing {len(spell_files)} spell templates...")
+    start_time = time.time()
     for spell_path in spell_files:
         spell_name = os.path.splitext(os.path.basename(spell_path))[0]
         if selected_class in keybinds and spell_name in keybinds[selected_class]:
             key = keybinds[selected_class][spell_name]
             template = cv2.imread(spell_path)
             if template is not None:
-                templates[spell_name] = (template, key)
+                # Convert to grayscale immediately
+                template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+                templates[spell_name] = (template_gray, key)
                 print(f"🖼️ Loaded {spell_name} -> {key}")
             else:
                 print(f"⚠️ Failed to load {spell_path}")
     
+    elapsed = time.time() - start_time
     print(f"✅ Loaded {len(templates)} templates for {selected_class}")
+    print(f"⚡ Optimization complete! Templates pre-processed in {elapsed:.3f}s")
     return templates
 
 def save_unrecognized_ability(screen):
     if selected_class is None or not settings.get('save_unrecognized', False):
         return
     
-    pending_dir = os.path.join("pending", selected_class)
-    os.makedirs(pending_dir, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filepath = os.path.join("pending", selected_class, f"unrecognized_{timestamp}.png")
-    cv2.imwrite(filepath, screen)
-    print(f"💾 Saved {filepath}")
+    try:
+        pending_dir = os.path.join("pending", selected_class)
+        os.makedirs(pending_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join("pending", selected_class, f"unrecognized_{timestamp}.png")
+        cv2.imwrite(filepath, screen)
+    except Exception as e:
+        print(f"❌ Error saving unrecognized ability: {str(e)}")
 
 def clean_pending_folder():
     pending_dir = "pending"
